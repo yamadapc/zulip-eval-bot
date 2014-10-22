@@ -50,6 +50,8 @@ waitUntilTimeout to c = forkIO (threadDelay to >> cancel c) >> wait c
 -- Logger
 --------------------------------------------------------------------------------
 
+-- |
+-- Logs events as they come in
 logEvent :: EventCallback
 logEvent (Event t i _) = putStrLn $ "New " ++ t ++
                                     " (ID: " ++ show i ++ ")'"
@@ -57,6 +59,8 @@ logEvent (Event t i _) = putStrLn $ "New " ++ t ++
 -- Bot structural helpers
 --------------------------------------------------------------------------------
 
+-- |
+-- Handles a message event
 handleMessage :: ZulipClient -> MessageCallback
 handleMessage z msg = do
     let eml = userEmail $ messageSender msg
@@ -72,6 +76,8 @@ handleMessage z msg = do
                 handleResult z msg "That's taking way too long... Good luck?"
             wait a >>= \r -> killThread tid >> handleResult z msg r
 
+-- |
+-- Handles the result of a command and sends it back the whoever sent it
 handleResult :: ZulipClient -> Message -> String -> IO ()
 handleResult _ _ "" = return ()
 handleResult z msg result = void $ case messageDisplayRecipient msg of
@@ -88,16 +94,22 @@ type Expression = (Language, Code)
 supportedLanguages :: [String]
 supportedLanguages = [ "haskell", "javascript", "lisp", "go" ]
 
+-- |
+-- Handles `@eval` commands
 handleEval :: String -> IO String
 handleEval input = do print input
                       liftM unlines $ mapM (\e -> print e >> evaluateImpl e)
                                            (parseExpressions input)
 
+-- |
+-- Parses "expressions" out of messages
 parseExpressions :: String -> [Expression]
 parseExpressions input = case break isSpace input of
     ("markdown", md) -> parseMarkdown md
     expr -> [expr]
 
+-- |
+-- Parses "expressions" out of markdown code blocks
 parseMarkdown :: String -> [Expression]
 parseMarkdown md = case parseOnly parseMarkdownCodeBlocks (C.pack md) of
     Right expr -> expr
@@ -114,6 +126,8 @@ parseMarkdownCodeBlock = do
     code <- manyTill anyWord8 (string "```")
     return (C.unpack $ B.pack language, C.unpack $ B.pack code)
 
+-- |
+-- Evaluates an expression with the existing `external-evaluator` scripts
 evaluateImpl :: Expression -> IO String
 evaluateImpl ("", _) = return "Usage: @eval <language> <funny-expression>"
 evaluateImpl (lg, _) | lg `notElem` supportedLanguages =
