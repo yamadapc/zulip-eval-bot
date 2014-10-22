@@ -2,9 +2,11 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Main where
 
-import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Concurrent (forkIO, killThread, newEmptyMVar, putMVar, takeMVar,
+                           threadDelay)
 import Control.Concurrent.Async
-import Control.Monad (unless, liftM, void)
+import Control.Exception (bracketOnError, evaluate)
+import Control.Monad (unless, liftM, void, when)
 
 import Data.Attoparsec.ByteString
 import qualified Data.ByteString as B (pack)
@@ -13,8 +15,13 @@ import qualified Data.ByteString.Internal as B (c2w)
 import Data.Char (isSpace)
 import Data.List (stripPrefix)
 
+import GHC.IO.Handle (hClose, hGetContents, hFlush, hPutStr)
+import GHC.IO.Handle.Types (Handle)
+
 import System.Environment (getEnv)
-import System.Process (readProcess)
+import System.Exit (ExitCode(..))
+import System.Process (CreateProcess(..), ProcessHandle, StdStream(..),
+                       createProcess, proc, terminateProcess, waitForProcess)
 
 import Web.HZulip
 
@@ -46,6 +53,62 @@ main = do
 -- Waits for a child to finish, but kills it after a timeout expires
 waitUntilTimeout :: Int -> Async a -> IO a
 waitUntilTimeout to c = forkIO (threadDelay to >> cancel c) >> wait c
+
+forth :: (a, b, c, d) -> d
+forth (_, _, _, x) = x
+
+-- |
+-- A patched version of readProcess which will correctly kill zombie PIDs
+-- if an asynchronous exception is thrown.
+readProcessWithCancellation :: FilePath -> [String] -> String -> IO String
+readProcessWithCancellation cmd args input =
+    bracketOnError (prepareProcess cmd args)
+                   (terminateProcess . forth)
+                   (consumeProcess input)
+
+-- |
+-- Takes some input, a process and its input/output handles created with
+-- `createProcess`, feeds the process' input handle with the input and
+-- consumes its output, returning it.
+--
+-- This is just the body of the standard `readProcess` function, with some
+-- bits removed.
+consumeProcess
+  :: String ->
+     (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle) ->
+     IO String
+consumeProcess input (Just inh, Just outh, _, pid) = do
+    -- Fork off a thread to consume the output
+    outMVar <- newEmptyMVar
+    output <- hGetContents outh
+    forkIO $ evaluate (length output) >> putMVar outMVar ()
+
+    -- Now write and flush any input
+    unless (null input) $ hPutStr inh input >> hFlush inh
+
+    -- Wait on the output to be consumed
+    -- (I don't know what will happen if an exception hits here; the
+    -- external process will be killed, which is the most crucial part, but
+    -- I think this spark will be left leaked).
+    takeMVar outMVar
+    hClose outh
+
+    -- On our implementation we don't care about errors. I'll fix this
+    -- later :P
+    _ <- waitForProcess pid
+    return output
+
+-- |
+-- A helper wrapper around `createProcess`. Will return a tuple with open
+-- input/output `Handle`s and a `ProcessHandle`
+prepareProcess
+  :: FilePath -> -- ^ command to run
+     [String] -> -- ^ list of arguments
+     IO (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
+prepareProcess cmd args = createProcess (proc cmd args) { std_in = CreatePipe
+                                                        , std_out = CreatePipe
+                                                        , std_err = Inherit
+                                                        }
 
 -- Logger
 --------------------------------------------------------------------------------
@@ -134,4 +197,5 @@ evaluateImpl (lg, _) | lg `notElem` supportedLanguages =
     return $ "I don't speak " ++ lg ++ " sorry..."
 
 evaluateImpl ("lisp", _) = return "(this (is (not (yet (supported (sorry))))))"
-evaluateImpl (lg, code) = readProcess ("./external-evaluators/" ++ lg) [code] ""
+evaluateImpl (lg, code) =
+    readProcessWithCancellation ("./external-evaluators/" ++ lg) [code] ""
