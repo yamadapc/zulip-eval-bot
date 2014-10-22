@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+mueval -X OverloadedStrings -t 10 --expression "$1"
