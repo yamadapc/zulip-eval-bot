@@ -20,6 +20,7 @@ import GHC.IO.Handle.Types (Handle)
 
 import System.Environment (getEnv)
 import System.Exit (ExitCode(..))
+import System.IO (BufferMode(..), hSetBuffering, stdout)
 import System.Process (CreateProcess(..), ProcessHandle, StdStream(..),
                        createProcess, proc, terminateProcess, waitForProcess)
 
@@ -32,6 +33,7 @@ import Web.HZulip
 -- Main entry point.
 main :: IO ()
 main = do
+    hSetBuffering stdout LineBuffering
     user <- getEnv "ZULIP_USER"
     key <- getEnv "ZULIP_KEY"
 
