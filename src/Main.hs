@@ -1,29 +1,33 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Main where
 
-import Control.Concurrent (forkIO, killThread, newEmptyMVar, putMVar, takeMVar,
-                           threadDelay)
-import Control.Concurrent.Async
-import Control.Exception (bracketOnError, evaluate)
-import Control.Monad (unless, liftM, void, when)
-
+import Control.Concurrent as Concurrent
+    (forkIO, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.Lifted (fork, threadDelay)
+import qualified Control.Concurrent.Async as Async
+    (Async(..), async, cancel, poll, wait)
+import qualified Control.Concurrent.Async.Lifted as Async.Lifted
+    (async, waitAny)
+import Control.Exception (bracketOnError, evaluate, handle)
+import Control.Monad ((>=>), unless, liftM, void, when)
 import Data.Attoparsec.ByteString
 import qualified Data.ByteString as B (pack)
 import qualified Data.ByteString.Char8 as C (pack, unpack)
 import qualified Data.ByteString.Internal as B (c2w)
 import Data.Char (isSpace)
+import qualified Data.Foldable as Foldable (forM_)
 import Data.List (stripPrefix)
-
+import Data.Maybe (isNothing)
 import GHC.IO.Handle (hClose, hGetContents, hFlush, hPutStr)
 import GHC.IO.Handle.Types (Handle)
-
 import System.Environment (getEnv)
-import System.Exit (ExitCode(..))
 import System.IO (BufferMode(..), hSetBuffering, stdout)
 import System.Process (CreateProcess(..), ProcessHandle, StdStream(..),
                        createProcess, proc, terminateProcess, waitForProcess)
 
+import Logging
 import Web.HZulip
 
 -- Entry point
@@ -36,25 +40,52 @@ main = do
     hSetBuffering stdout LineBuffering
     user <- getEnv "ZULIP_USER"
     key <- getEnv "ZULIP_KEY"
+    handle (logException >=> const main)
+           (withZulipCreds user key startBot)
 
-    zulip <- newZulip user key
+startBot :: ZulipM ()
+startBot = do
+    -- Subscribe to all avaiable streams
+    streams <- getStreams
+    addSubscriptions streams
 
-    putStrLn "Listening for events"
-    loggingA <- async $ onNewEvent zulip ["message", "subscriptions"] logEvent
-    handlingMessagesA <- async $ onNewMessage zulip (handleMessage zulip)
+    loggingA <- Async.Lifted.async $ onNewEvent ["message", "subscriptions"]
+                                                logEvent
 
-    void $ waitAny [loggingA, handlingMessagesA]
-    putStrLn "Bye! Something went wrong, this shouldn't have happened!"
-    putStrLn "Report bugs to:"
-    putStrLn "https://github.com/yamadapc/hzulip/issues"
+    handlingMessagesA <- Async.Lifted.async $ onNewMessage handleMessage
+    void $ Async.Lifted.waitAny [loggingA, handlingMessagesA]
+    lift $ putStrLn
+        ( "Bye! Something went wrong, this shouldn't have happened!\n"
+        ++ "Report bugs to:\n"
+        ++ "https://github.com/yamadapc/hzulip/issues"
+        )
 
 -- Concurrency helpers
 --------------------------------------------------------------------------------
 
 -- |
 -- Waits for a child to finish, but kills it after a timeout expires
-waitUntilTimeout :: Int -> Async a -> IO a
-waitUntilTimeout to c = forkIO (threadDelay to >> cancel c) >> wait c
+waitUntilTimeout :: ZulipM () -> Int -> Async.Async a -> ZulipM a
+waitUntilTimeout onTo to c = do
+    _ <- fork $ do
+        threadDelay to
+        done <- lift $ Async.poll c
+        when (isNothing done) $ do
+            lift $ Async.cancel c
+            onTo
+    lift $ Async.wait c
+
+{-
+:t fork
+
+:info MonadBaseControl
+
+:set prompt "> "
+
+import Control.Monad.Trans.Reader
+
+:info ReaderT
+-}
 
 forth :: (a, b, c, d) -> d
 forth (_, _, _, x) = x
@@ -75,15 +106,14 @@ readProcessWithCancellation cmd args input =
 --
 -- This is just the body of the standard `readProcess` function, with some
 -- bits removed.
-consumeProcess
-  :: String ->
-     (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle) ->
-     IO String
+consumeProcess :: String
+               -> (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
+               -> IO String
 consumeProcess input (Just inh, Just outh, _, pid) = do
     -- Fork off a thread to consume the output
     outMVar <- newEmptyMVar
     output <- hGetContents outh
-    forkIO $ evaluate (length output) >> putMVar outMVar ()
+    void $ forkIO $ evaluate (length output) >> putMVar outMVar ()
 
     -- Now write and flush any input
     unless (null input) $ hPutStr inh input >> hFlush inh
@@ -97,16 +127,16 @@ consumeProcess input (Just inh, Just outh, _, pid) = do
 
     -- On our implementation we don't care about errors. I'll fix this
     -- later :P
-    _ <- waitForProcess pid
+    void $ waitForProcess pid
     return output
+consumeProcess _ _ = fail "There's a mistake in this code."
 
 -- |
 -- A helper wrapper around `createProcess`. Will return a tuple with open
 -- input/output `Handle`s and a `ProcessHandle`
-prepareProcess
-  :: FilePath -> -- ^ command to run
-     [String] -> -- ^ list of arguments
-     IO (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
+prepareProcess :: FilePath -- ^ command to run
+               -> [String] -- ^ list of arguments
+               -> IO (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
 prepareProcess cmd args = createProcess (proc cmd args) { std_in = CreatePipe
                                                         , std_out = CreatePipe
                                                         , std_err = Inherit
@@ -118,36 +148,37 @@ prepareProcess cmd args = createProcess (proc cmd args) { std_in = CreatePipe
 -- |
 -- Logs events as they come in
 logEvent :: EventCallback
-logEvent (Event t i _) = putStrLn $ "New " ++ t ++
-                                    " (ID: " ++ show i ++ ")'"
+logEvent (Event t i _) = lift $ putStrLn $ "New " ++ t ++
+                                           " (ID: " ++ show i ++ ")'"
 
 -- Bot structural helpers
 --------------------------------------------------------------------------------
 
 -- |
 -- Handles a message event
-handleMessage :: ZulipClient -> MessageCallback
-handleMessage z msg = do
+handleMessage :: MessageCallback
+handleMessage msg = do
     let eml = userEmail $ messageSender msg
         cnt = messageContent msg
+    ceml <- clientEmail `fmap` ask
 
-    print eml
-    print cnt
     -- Don't execute commands we sent to ourselves
-    unless (eml == clientEmail z) $ case stripPrefix "@eval " cnt of
-        Nothing -> return ()
-        Just input -> withAsync (handleEval input) $ \a -> do
-            tid <- forkIO $ threadDelay 20000000 >> cancel a >>
-                handleResult z msg "That's taking way too long... Good luck?"
-            wait a >>= \r -> killThread tid >> handleResult z msg r
+    unless (eml == ceml) $ Foldable.forM_ (stripPrefix "@eval " cnt)
+                                          handleEvalWithTO
+
+  where handleEvalWithTO input = do
+            r <- waitUntilTimeout
+                    (handleResult msg "That's taking way too long... Good luck?")
+                    20000000 =<< lift (Async.async (handleEval input))
+            handleResult msg r
 
 -- |
 -- Handles the result of a command and sends it back the whoever sent it
-handleResult :: ZulipClient -> Message -> String -> IO ()
-handleResult _ _ "" = return ()
-handleResult z msg result = void $ case messageDisplayRecipient msg of
-    Left stream -> sendStreamMessage z stream (messageSubject msg) result
-    Right users -> sendPrivateMessage z (map userEmail users) result
+handleResult :: Message -> String -> ZulipM ()
+handleResult _ "" = return ()
+handleResult msg result = void $ case messageDisplayRecipient msg of
+    Left stream -> sendStreamMessage stream (messageSubject msg) result
+    Right users -> sendPrivateMessage (map userEmail users) result
 
 -- Eval Command
 --------------------------------------------------------------------------------
