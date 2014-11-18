@@ -162,7 +162,9 @@ handleMessage msg = do
                     20000000 =<< lift (Async.async (handleEval input))
             handleResult msg r
         onTimeout = do
-            lift $ logWarn $ "Message " ++ show (messageId msg) ++ "timed-out"
+            lift $ logWarn $
+                "(" ++ show (messageId msg) ++ ") Message timed-out"
+
             handleResult msg "That's taking way too long... Good luck?"
 
 
@@ -172,8 +174,11 @@ handleResult :: Message -> String -> ZulipM ()
 handleResult _ "" = return ()
 handleResult msg result = do
     let r = messageDisplayRecipient msg
+        mid = show $ messageId msg
 
-    lift $ logInfo $ "Sending \"" ++ result ++ "\" to " ++ show r
+    lift $ logInfo $
+        "(" ++ mid ++ ") Sending \"" ++ result ++ "\" to " ++ show r
+
     void $ case r of
         Left stream -> sendStreamMessage stream (messageSubject msg) result
         Right users -> sendPrivateMessage (map userEmail users) result
