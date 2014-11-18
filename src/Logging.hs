@@ -12,10 +12,9 @@ logColor :: Color -> String -> IO ()
 logColor c s = do
     setSGR [ SetConsoleIntensity BoldIntensity
            , SetColor Foreground Vivid c
-           , SetColor Background Dull c
            ]
     date <- getCurrentTime
-    printf "[%s]" (formatTime defaultTimeLocale "%H" date)
+    printf "[%s] " (formatTime defaultTimeLocale "%X" date)
 
     setSGR [ SetConsoleIntensity BoldIntensity
            , SetColor Foreground Vivid White
@@ -24,6 +23,12 @@ logColor c s = do
 
 logInfo :: String -> IO ()
 logInfo = logColor Blue
+
+logWarn :: String -> IO ()
+logWarn = logColor Yellow
+
+logError :: String -> IO ()
+logError = logColor Red
 
 logException :: SomeException -> IO ()
 logException = logColor Red . show

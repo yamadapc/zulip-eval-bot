@@ -9,7 +9,7 @@ import Control.Concurrent.Lifted (fork, threadDelay)
 import qualified Control.Concurrent.Async as Async
     (Async(..), async, cancel, poll, wait)
 import qualified Control.Concurrent.Async.Lifted as Async.Lifted
-    (async, waitAny)
+    (async, wait)
 import Control.Exception (bracketOnError, evaluate, handle)
 import Control.Monad ((>=>), unless, liftM, void, when)
 import Data.Attoparsec.ByteString
@@ -49,15 +49,12 @@ startBot = do
     streams <- getStreams
     addSubscriptions streams
 
-    loggingA <- Async.Lifted.async $ onNewEvent ["message", "subscriptions"]
-                                                logEvent
-
     handlingMessagesA <- Async.Lifted.async $ onNewMessage handleMessage
-    void $ Async.Lifted.waitAny [loggingA, handlingMessagesA]
-    lift $ putStrLn
+    void $ lift $ Async.wait handlingMessagesA
+    lift $ logError
         ( "Bye! Something went wrong, this shouldn't have happened!\n"
-        ++ "Report bugs to:\n"
-        ++ "https://github.com/yamadapc/hzulip/issues"
+       ++ "Report bugs to:\n"
+       ++ "https://github.com/yamadapc/zulip-eval-bot/issues"
         )
 
 -- Concurrency helpers
@@ -142,15 +139,6 @@ prepareProcess cmd args = createProcess (proc cmd args) { std_in = CreatePipe
                                                         , std_err = Inherit
                                                         }
 
--- Logger
---------------------------------------------------------------------------------
-
--- |
--- Logs events as they come in
-logEvent :: EventCallback
-logEvent (Event t i _) = lift $ putStrLn $ "New " ++ t ++
-                                           " (ID: " ++ show i ++ ")'"
-
 -- Bot structural helpers
 --------------------------------------------------------------------------------
 
@@ -160,25 +148,35 @@ handleMessage :: MessageCallback
 handleMessage msg = do
     let eml = userEmail $ messageSender msg
         cnt = messageContent msg
+        mid = show $ messageId msg
+
     ceml <- clientEmail `fmap` ask
 
+    lift $ logInfo $ "(" ++ mid ++ ") Message from " ++ eml
     -- Don't execute commands we sent to ourselves
     unless (eml == ceml) $ Foldable.forM_ (stripPrefix "@eval " cnt)
                                           handleEvalWithTO
-
   where handleEvalWithTO input = do
             r <- waitUntilTimeout
-                    (handleResult msg "That's taking way too long... Good luck?")
+                    onTimeout
                     20000000 =<< lift (Async.async (handleEval input))
             handleResult msg r
+        onTimeout = do
+            lift $ logWarn $ "Message " ++ show (messageId msg) ++ "timed-out"
+            handleResult msg "That's taking way too long... Good luck?"
+
 
 -- |
 -- Handles the result of a command and sends it back the whoever sent it
 handleResult :: Message -> String -> ZulipM ()
 handleResult _ "" = return ()
-handleResult msg result = void $ case messageDisplayRecipient msg of
-    Left stream -> sendStreamMessage stream (messageSubject msg) result
-    Right users -> sendPrivateMessage (map userEmail users) result
+handleResult msg result = do
+    let r = messageDisplayRecipient msg
+
+    lift $ logInfo $ "Sending \"" ++ result ++ "\" to " ++ show r
+    void $ case r of
+        Left stream -> sendStreamMessage stream (messageSubject msg) result
+        Right users -> sendPrivateMessage (map userEmail users) result
 
 -- Eval Command
 --------------------------------------------------------------------------------
@@ -193,9 +191,11 @@ supportedLanguages = [ "haskell", "javascript", "lisp", "go" ]
 -- |
 -- Handles `@eval` commands
 handleEval :: String -> IO String
-handleEval input = do print input
-                      liftM unlines $ mapM (\e -> print e >> evaluateImpl e)
-                                           (parseExpressions input)
+handleEval input = do
+    print input
+    liftM unlines $ mapM
+        (\e -> print e >> evaluateImpl e)
+        (parseExpressions input)
 
 -- |
 -- Parses "expressions" out of messages
