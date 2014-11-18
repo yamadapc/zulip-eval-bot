@@ -191,7 +191,7 @@ type Code = String
 type Expression = (Language, Code)
 
 supportedLanguages :: [String]
-supportedLanguages = [ "haskell", "javascript", "lisp", "go" ]
+supportedLanguages = [ "haskell", "haskell-type", "javascript", "go" ]
 
 -- |
 -- Handles `@eval` commands
@@ -230,10 +230,11 @@ parseMarkdownCodeBlock = do
 -- |
 -- Evaluates an expression with the existing `external-evaluator` scripts
 evaluateImpl :: Expression -> IO String
-evaluateImpl ("", _) = return "Usage: @eval <language> <funny-expression>"
+evaluateImpl (t, _) | t == "" || t == "help" =
+    return $ "Usage: @eval <language> <funny-expression>\n" ++
+             "Currently supported languages are:\n" ++
+             foldr (\l m -> show l ++ ", " ++ m) "" supportedLanguages
 evaluateImpl (lg, _) | lg `notElem` supportedLanguages =
     return $ "I don't speak " ++ lg ++ " sorry..."
-
-evaluateImpl ("lisp", _) = return "(this (is (not (yet (supported (sorry))))))"
 evaluateImpl (lg, code) =
     readProcessWithCancellation ("./external-evaluators/" ++ lg) [code] ""
