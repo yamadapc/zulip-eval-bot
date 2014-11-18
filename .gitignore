@@ -1,5 +1,5 @@
 dist
 .vagrant
 .cabal-sandbox
-.env
 cabal.sandbox.config
+.creds
